@@ -706,6 +706,7 @@ class Keyboard:
 
     Keyboard.releaseKey("shift")  # Ensure shift is released
 
+
 class Typer:
   @staticmethod
   def legitTyper(string: str, wpm: int) -> None:
