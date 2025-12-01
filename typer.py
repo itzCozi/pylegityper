@@ -852,8 +852,8 @@ class Typer:
 while True:
   string = input("> ")
   if string.lower() in ["exit", "quit"]: break
-  wpm = random.randint(85, 100)
-  for i in range(5):
+  wpm = random.randint(95, 120)
+  for i in range(3):
     print(f' {"-" * 3 + str(5 - i) + "-" * 3} ', end="\r", flush=True)
     time.sleep(1)
   try:
