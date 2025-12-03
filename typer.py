@@ -1,12 +1,78 @@
 import ctypes
-import time
+import itertools
 import random
 import shutil
+import threading
+import time
 from ctypes import wintypes
 from typing import Any, Literal, Self, Tuple
 
 import win32api
 from win32con import *
+
+
+class CancelRequested(Exception):
+  """Raised when the Ctrl+Alt cancel hotkey is detected."""
+
+
+CTRL_VKS: tuple[int, ...] = (VK_CONTROL, VK_LCONTROL, VK_RCONTROL)
+ALT_VKS: tuple[int, ...] = (VK_MENU, VK_LMENU, VK_RMENU)
+
+
+def _is_pressed(vk_codes: tuple[int, ...]) -> bool:
+  return any(win32api.GetAsyncKeyState(code) & 0x8000 for code in vk_codes)
+
+
+def cancel_hotkey_pressed() -> bool:
+  return _is_pressed(CTRL_VKS) and _is_pressed(ALT_VKS)
+
+
+def sleep_with_cancel(duration: float, poll_interval: float = 0.05) -> None:
+  """Sleep in small chunks while watching for the cancel hotkey."""
+  end_time: float = time.monotonic() + max(0.0, duration)
+  while True:
+    if cancel_hotkey_pressed():
+      raise CancelRequested
+    remaining: float = end_time - time.monotonic()
+    if remaining <= 0:
+      break
+    time.sleep(min(poll_interval, remaining))
+
+
+class LoadingIndicator:
+  """Console spinner shown while typing is in progress."""
+
+  def __init__(self, message: str = "Typing", interval: float = 0.1) -> None:
+    self.message = message
+    self.interval = interval
+    self._stop_event: threading.Event = threading.Event()
+    self._thread: threading.Thread | None = None
+
+  def _run(self) -> None:
+    spinner = itertools.cycle("|/-\\")
+    while not self._stop_event.is_set():
+      frame = next(spinner)
+      print(f"\r{self.message} {frame}", end="", flush=True)
+      if self._stop_event.wait(self.interval):
+        break
+
+  def start(self) -> None:
+    if self._thread and self._thread.is_alive():
+      return
+    self._stop_event.clear()
+    self._thread = threading.Thread(
+      target=self._run,
+      name="LoadingIndicator",
+      daemon=True
+    )
+    self._thread.start()
+
+  def stop(self, clear: bool = True) -> None:
+    self._stop_event.set()
+    if self._thread and self._thread.is_alive():
+      self._thread.join(timeout=self.interval * 4)
+    if clear:
+      clear_status_line()
 
 
 class Keyboard:
@@ -728,137 +794,165 @@ class Typer:
         error_type="r", runtime_error="wpm must be a positive integer")
       return Keyboard.exit_code
 
-    base_delay: float = 60.0 / (wpm * 5.0)
+    indicator = LoadingIndicator()
+    indicator.start()
+    try:
+      base_delay: float = 60.0 / (wpm * 5.0)
 
-    def delay(mult: float = 1.0) -> None:
-      mean = base_delay * mult
-      std = max(0.015, mean * 0.35)
-      d = random.gauss(mean, std)
-      d = max(0.02, min(d, base_delay * 3.0))
-      time.sleep(d)
+      def ensure_not_cancelled() -> None:
+        if cancel_hotkey_pressed():
+          raise CancelRequested
 
-    def type_char(ch: str) -> None:
-      Keyboard.keyboardWrite(ch)
+      def delay(mult: float = 1.0) -> None:
+        ensure_not_cancelled()
+        mean = base_delay * mult
+        std = max(0.015, mean * 0.35)
+        d = random.gauss(mean, std)
+        d = max(0.02, min(d, base_delay * 3.0))
+        sleep_with_cancel(d)
 
-    def backspace(n: int = 1) -> None:
-      for _ in range(n):
-        Keyboard.pressAndReleaseKey("back")
-        time.sleep(0.02 + random.random() * 0.05)
+      def type_char(ch: str) -> None:
+        ensure_not_cancelled()
+        Keyboard.keyboardWrite(ch)
 
-    def supported(ch: str) -> bool:
-      return (
-        ch in Keyboard.vk_codes
-        or ch.lower() in Keyboard.vk_codes
-        or ch.isupper()
-      )
+      def backspace(n: int = 1) -> None:
+        for _ in range(n):
+          ensure_not_cancelled()
+          Keyboard.pressAndReleaseKey("back")
+          sleep_with_cancel(0.02 + random.random() * 0.05)
 
-    def neighbor_map() -> dict[str, list[str]]:
-      rows = [
-        "`1234567890-=",
-        "qwertyuiop[]\\",
-        "asdfghjkl;'",
-        "zxcvbnm,./",
-      ]
-      rows = [r.lower() for r in rows]
-      vk = Keyboard.vk_codes
-      mapping: dict[str, list[str]] = {}
-      for r_idx, row in enumerate(rows):
-        for c_idx, ch in enumerate(row):
-          neigh: set[str] = set()
-          for dc in (-1, 1):
-            cc = c_idx + dc
-            if 0 <= cc < len(row):
-              neigh.add(row[cc])
-          for dr in (-1, 1):
-            rr = r_idx + dr
-            if 0 <= rr < len(rows):
-              other = rows[rr]
-              for dc in (-1, 0, 1):
-                cc = c_idx + dc
-                if 0 <= cc < len(other):
-                  neigh.add(other[cc])
-          mapping[ch] = [n for n in neigh if (n in vk)]
-      return mapping
+      def supported(ch: str) -> bool:
+        return (
+          ch in Keyboard.vk_codes
+          or ch.lower() in Keyboard.vk_codes
+          or ch.isupper()
+        )
 
-    NEIGHBORS = neighbor_map()
+      def neighbor_map() -> dict[str, list[str]]:
+        rows = [
+          "`1234567890-=",
+          "qwertyuiop[]\\",
+          "asdfghjkl;'",
+          "zxcvbnm,./",
+        ]
+        rows = [r.lower() for r in rows]
+        vk = Keyboard.vk_codes
+        mapping: dict[str, list[str]] = {}
+        for r_idx, row in enumerate(rows):
+          for c_idx, ch in enumerate(row):
+            neigh: set[str] = set()
+            for dc in (-1, 1):
+              cc = c_idx + dc
+              if 0 <= cc < len(row):
+                neigh.add(row[cc])
+            for dr in (-1, 1):
+              rr = r_idx + dr
+              if 0 <= rr < len(rows):
+                other = rows[rr]
+                for dc in (-1, 0, 1):
+                  cc = c_idx + dc
+                  if 0 <= cc < len(other):
+                    neigh.add(other[cc])
+            mapping[ch] = [n for n in neigh if (n in vk)]
+        return mapping
 
-    # Higher-level cadence knobs
-    mistake_prob_neighbor = 0.06     # hit adjacent wrong key and fix
-    mistake_prob_double = 0.03       # double press a key then backspace
-    mistake_prob_transpose = 0.02    # hit the next char first, then backspace
-    pause_after_space_chance = 0.18  # occasional thinking pause after spaces
+      NEIGHBORS = neighbor_map()
 
-    i = 0
-    while i < len(string):
-      ch = string[i]
+      # Higher-level cadence knobs
+      mistake_prob_neighbor = 0.06     # hit adjacent wrong key and fix
+      mistake_prob_double = 0.03       # double press a key then backspace
+      mistake_prob_transpose = 0.02    # hit the next char first, then backspace
+      pause_after_space_chance = 0.18  # occasional thinking pause after spaces
 
-      if not supported(ch):
-        i += 1
-        continue
+      i = 0
+      while i < len(string):
+        ensure_not_cancelled()
+        ch = string[i]
 
-      if ch in ".!?":
-        punct_mult = 5.0
-      elif ch in ",;:":
-        punct_mult = 2.5
-      elif ch == " ":
-        punct_mult = 1.4
-      else:
-        punct_mult = 1.0
+        if not supported(ch):
+          i += 1
+          continue
 
-      r = random.random()
-      made_mistake = False
+        if ch in ".!?":
+          punct_mult = 5.0
+        elif ch in ",;:":
+          punct_mult = 2.5
+        elif ch == " ":
+          punct_mult = 1.4
+        else:
+          punct_mult = 1.0
 
-      if (
-        r < mistake_prob_transpose
-        and i + 1 < len(string)
-        and string[i + 1] != "\n"
-        and supported(string[i + 1])
-      ):
-        wrong = string[i + 1]
-        type_char(wrong)
-        delay(0.6)
-        backspace()
-        made_mistake = True
+        r = random.random()
+        made_mistake = False
 
-      elif r < mistake_prob_transpose + mistake_prob_neighbor:
-        neighs = NEIGHBORS.get(ch.lower(), [])
-        if neighs:
-          wrong = random.choice(neighs)
-          wrong = wrong.upper() if ch.isupper() else wrong
+        if (
+          r < mistake_prob_transpose
+          and i + 1 < len(string)
+          and string[i + 1] != "\n"
+          and supported(string[i + 1])
+        ):
+          wrong = string[i + 1]
           type_char(wrong)
-          delay(0.75)
+          delay(0.6)
           backspace()
           made_mistake = True
 
-      elif r < mistake_prob_transpose + mistake_prob_neighbor + mistake_prob_double:
+        elif r < mistake_prob_transpose + mistake_prob_neighbor:
+          neighs = NEIGHBORS.get(ch.lower(), [])
+          if neighs:
+            wrong = random.choice(neighs)
+            wrong = wrong.upper() if ch.isupper() else wrong
+            type_char(wrong)
+            delay(0.75)
+            backspace()
+            made_mistake = True
+
+        elif r < mistake_prob_transpose + mistake_prob_neighbor + mistake_prob_double:
+          type_char(ch)
+          delay(0.45)
+          type_char(ch)
+          delay(0.6)
+          backspace()
+          delay(punct_mult)
+          i += 1
+          continue
+
         type_char(ch)
-        delay(0.45)
-        type_char(ch)
-        delay(0.6)
-        backspace()
-        delay(punct_mult)
+
+        delay(punct_mult * (1.1 if made_mistake else 1.0))
+
+        if ch == " " and random.random() < pause_after_space_chance:
+          sleep_with_cancel(random.uniform(0.15, 0.65) + base_delay * random.uniform(1.5, 3.5))
+
         i += 1
-        continue
+    finally:
+      indicator.stop()
 
-      type_char(ch)
 
-      delay(punct_mult * (1.1 if made_mistake else 1.0))
+def clear_status_line() -> None:
+  try:
+    cols: int = shutil.get_terminal_size().columns
+  except Exception:
+    cols = 80
+  print("\r" + (" " * cols) + "\r", end="", flush=True)
 
-      if ch == " " and random.random() < pause_after_space_chance:
-        time.sleep(random.uniform(0.15, 0.65) + base_delay * random.uniform(1.5, 3.5))
 
-      i += 1
+def run_countdown(seconds: int = 3) -> None:
+  for remaining in range(seconds, 0, -1):
+    print(f' {"-" * 3 + str(remaining) + "-" * 3} ', end="\r", flush=True)
+    sleep_with_cancel(1.0)
+
 
 while True:
   string = input("> ")
-  if string.lower() in ["exit", "quit"]: break
-  wpm = random.randint(95, 120)
-  for i in range(3):
-    print(f' {"-" * 3 + str(5 - i) + "-" * 3} ', end="\r", flush=True)
-    time.sleep(1)
+  if string.lower() in ["exit", "quit"]:
+    break
+  wpm = random.randint(100, 120)
   try:
-    _cols = shutil.get_terminal_size().columns
-  except Exception:
-    _cols = 80
-  print("\r" + (" " * _cols) + "\r", end="", flush=True)
-  Typer.legitTyper(string, wpm)
+    run_countdown(3)
+    clear_status_line()
+    Typer.legitTyper(string, wpm)
+  except CancelRequested:
+    clear_status_line()
+    print("\r[Cancelled]", end="\n", flush=True)
+    continue
