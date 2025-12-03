@@ -1,8 +1,6 @@
 import ctypes
-import itertools
 import random
 import shutil
-import threading
 import time
 from ctypes import wintypes
 from typing import Any, Literal, Self, Tuple
@@ -37,42 +35,6 @@ def sleep_with_cancel(duration: float, poll_interval: float = 0.05) -> None:
     if remaining <= 0:
       break
     time.sleep(min(poll_interval, remaining))
-
-
-class LoadingIndicator:
-  """Console spinner shown while typing is in progress."""
-
-  def __init__(self, message: str = "Typing", interval: float = 0.1) -> None:
-    self.message = message
-    self.interval = interval
-    self._stop_event: threading.Event = threading.Event()
-    self._thread: threading.Thread | None = None
-
-  def _run(self) -> None:
-    spinner = itertools.cycle("|/-\\")
-    while not self._stop_event.is_set():
-      frame = next(spinner)
-      print(f"\r{self.message} {frame}", end="", flush=True)
-      if self._stop_event.wait(self.interval):
-        break
-
-  def start(self) -> None:
-    if self._thread and self._thread.is_alive():
-      return
-    self._stop_event.clear()
-    self._thread = threading.Thread(
-      target=self._run,
-      name="LoadingIndicator",
-      daemon=True
-    )
-    self._thread.start()
-
-  def stop(self, clear: bool = True) -> None:
-    self._stop_event.set()
-    if self._thread and self._thread.is_alive():
-      self._thread.join(timeout=self.interval * 4)
-    if clear:
-      clear_status_line()
 
 
 class Keyboard:
@@ -790,12 +752,13 @@ class Typer:
       Keyboard.error(error_type="p", var="wpm", type="integer")
       return Keyboard.exit_code
     if wpm <= 0:
-      Keyboard.error(
+      Keyboard.error( 
         error_type="r", runtime_error="wpm must be a positive integer")
       return Keyboard.exit_code
 
-    indicator = LoadingIndicator()
-    indicator.start()
+    message_shown = False
+    print("\rPress Alt + Ctrl to stop typing...", end="", flush=True)
+    message_shown = True
     try:
       base_delay: float = 60.0 / (wpm * 5.0)
 
@@ -926,7 +889,8 @@ class Typer:
 
         i += 1
     finally:
-      indicator.stop()
+      if message_shown:
+        clear_status_line()
 
 
 def clear_status_line() -> None:
@@ -934,7 +898,8 @@ def clear_status_line() -> None:
     cols: int = shutil.get_terminal_size().columns
   except Exception:
     cols = 80
-  print("\r" + (" " * cols) + "\r", end="", flush=True)
+  width: int = max(cols - 1, 0)
+  print("\r" + (" " * width) + "\r", end="", flush=True)
 
 
 def run_countdown(seconds: int = 3) -> None:
